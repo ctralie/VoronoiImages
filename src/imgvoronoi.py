@@ -132,26 +132,74 @@ def stochastic_universal_sample(weights, target_points, jitter=0):
     return uv
 
 X_GRIDS = {}
-def get_site_colors_and_voronoi_img(vcoords, I, n_neighbs, temperature=20):
+def get_nn_weights(vcoords, shape, n_neighbs, device, temperature=20):
     """
-    Compute the color values associated to a set of voronoi sites,
-    as well as the implied Voronoi image
+    For each pixel/voxel, compute the nearest neighbors in the sites
 
     Parameters
     ----------
     vcoords: torch.tensor(n_sites, dim)
         Coordinates of voronoi sites
-    I: torch.tensor(M, N, ..., n_channels)
-        Image we're trying to approximate
+    shape: tuple of (M, N, ..., n_channels)
+        Shape of the image we're trying to approximate
     n_neighbs: int
         Number of sites to use as nearest neighbors for each point
+    device: str
+        Torch device
     temperature: float
         Temperature to use in softmax for neighbor weights
     
     Returns
     -------
-    J: torch.tensor(M, N, ..., n_channels)
-        Voronoi image
+    nn_idx: ndarray(M*N*..., n_neighbs)
+        Indices of k-nearest neighbors for each pixel/voxel
+    weights: torch.tensor(M*N*..., n_neighbs)
+        Weights of each neighbor for each pixel/voxel
+    """
+    import torch
+    from scipy.spatial import KDTree
+    ## Step 1: Setup grid of pixels
+    if not shape in X_GRIDS:
+        X = torch.meshgrid(*[torch.linspace(0, 1, n) for n in shape[0:-1]], indexing='ij')
+        X = torch.concatenate(tuple([Xi.unsqueeze(-1) for Xi in X]), dim=-1).flatten(0, -2).to(device)
+        X_GRIDS[shape] = X # Cache for future iterations since this doesn't change
+    X = X_GRIDS[shape]
+
+    ## Step 2: Compute distance from all pixels to landmarks
+    tree = KDTree(vcoords.detach().cpu().numpy())
+    _, nn_idx = tree.query(X.detach().cpu().numpy(), k=n_neighbs) # Nearest landmark indices to pixels
+    if n_neighbs == 1:
+        nn_idx = nn_idx[:, None]
+
+    ## Step 3: Based on the landmark locations, compute the weight influence
+    ## of each landmark on each pixel using softmax
+    weights = torch.zeros(np.prod(shape[0:-1]), n_neighbs).to(device)
+    for i in range(n_neighbs):
+        dX = vcoords[nn_idx[:, i], :] - X
+        weights[:, i] = 1/(1e-4+torch.sum(dX**2, dim=1))
+    mx = torch.max(weights, dim=1).values
+    mx = mx.view(mx.numel(), 1)
+    weights = torch.exp(temperature*weights/mx)
+    weights = weights/torch.sum(weights, dim=1, keepdims=True)
+
+    return nn_idx, weights
+
+def get_avg_colors(I, vcoords, nn_idx):
+    """
+    Compute the average color of the pixels in each region
+
+    Parameters
+    ----------
+    I: torch.tensor(M, N, ..., n_channels)
+        Image we're trying to approximate
+    vcoords: torch.tensor(n_sites, dim)
+        Coordinates of voronoi sites
+    nn_idx: ndarray(M*N*..., n_neighbs)
+        Indices of k-nearest neighbors for each pixel/voxel
+    weights: torch.tensor(M*N*..., n_neighbs)
+
+    Returns
+    -------
     colors: torch.tensor(n_sites, n_channels)
         Voronoi site colors
     colors_valid: ndarray(n_sites)
@@ -159,47 +207,47 @@ def get_site_colors_and_voronoi_img(vcoords, I, n_neighbs, temperature=20):
     """
     import torch
     from scipy import sparse
-    from scipy.spatial import KDTree
-    ## Step 1: Setup grid of pixels
-    if not I.shape in X_GRIDS:
-        X = torch.meshgrid(*[torch.linspace(0, 1, n) for n in I.shape[0:-1]], indexing='ij')
-        X = torch.concatenate(tuple([Xi.unsqueeze(-1) for Xi in X]), dim=-1).flatten(0, -2).to(vcoords)
-        X_GRIDS[I.shape] = X # Cache for future iterations since this doesn't change
-    X = X_GRIDS[I.shape]
-
-    ## Step 1: Compute distance from all pixels to landmarks
-    tree = KDTree(vcoords.detach().cpu().numpy())
-    _, idx = tree.query(X.detach().cpu().numpy(), k=n_neighbs) # Nearest landmark indices to pixels
-    if n_neighbs == 1:
-        idx = idx[:, None]
-
-    ## Step 2: Based on the landmark locations, compute the weight influence
-    ## of each landmark on each pixel using softmax
-    weights = torch.zeros(np.prod(I.shape[0:-1]), n_neighbs).to(I)
-    for i in range(n_neighbs):
-        dX = vcoords[idx[:, i], :] - X
-        weights[:, i] = 1/(1e-4+torch.sum(dX**2, dim=1))
-    mx = torch.max(weights, dim=1).values
-    mx = mx.view(mx.numel(), 1)
-    weights = torch.exp(temperature*weights/mx)
-    weights = weights/torch.sum(weights, dim=1, keepdims=True)
-    
-    ## Step 3: Compute the average color of the pixels in each region
     n_channels = I.shape[-1]
-    rows = ((idx[:, 0][:, None])*np.ones((1, n_channels))).flatten()
-    cols = (np.ones((idx.shape[0], 1))*(np.arange(n_channels)[None, :])).flatten()
+    rows = ((nn_idx[:, 0][:, None])*np.ones((1, n_channels))).flatten()
+    cols = (np.ones((nn_idx.shape[0], 1))*(np.arange(n_channels)[None, :])).flatten()
     colors = sparse.coo_matrix((I.cpu().numpy().flatten(), (rows, cols)), shape=(vcoords.shape[0], n_channels)).toarray()
-    counts = sparse.coo_matrix((np.ones(idx.shape[0]), (idx[:, 0], np.zeros(idx.shape[0]))), shape=(vcoords.shape[0], 1)).toarray()
+    counts = sparse.coo_matrix((np.ones(nn_idx.shape[0]), (nn_idx[:, 0], np.zeros(nn_idx.shape[0]))), shape=(vcoords.shape[0], 1)).toarray()
     denom = np.array(counts)
     denom[denom == 0] = 1
     colors = torch.from_numpy(colors/denom).to(vcoords)
-    
-    ## Step 4: Splat the colors from each landmark over the pixels within their influence
-    J = torch.zeros(X.shape[0], n_channels).to(I)
+    return colors, counts > 0
+
+def splat_colors(nn_idx, weights, colors, shape, device):
+    """
+    Splat the colors from each landmark over the pixels within their influence
+
+    Parameters
+    ----------
+    nn_idx: ndarray(M*N*..., n_neighbs)
+        Indices of k-nearest neighbors for each pixel/voxel
+    weights: torch.tensor(M*N*..., n_neighbs)
+        Weights of each neighbor for each pixel/voxel
+    colors: torch.tensor(n_sites, n_channels)
+        Voronoi site colors
+    shape: tuple of (M, N, ..., n_channels)
+        Shape of the image we're trying to approximate
+    device: str
+        Torch device
+
+    Returns
+    -------
+    J: torch.tensor(M, N, ..., n_channels)
+        Voronoi image
+    """
+    import torch
+    n_channels = shape[-1]
+    n_voxels = nn_idx.shape[0]
+    n_neighbs = nn_idx.shape[1]
+    J = torch.zeros(n_voxels, n_channels).to(device)
     for i in range(n_neighbs):
-        J += colors[idx[:, i], :]*(weights[:, i].view(weights.shape[0], 1))
-    J = J.view(I.shape)
-    return J, colors, counts > 0
+        J += colors[nn_idx[:, i], :]*(weights[:, i].view(n_voxels, 1))
+    J = J.view(shape)
+    return J
 
 def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=50, lr=2e-2, splat_intervals=[], plot_iter_interval=0, verbose=False):
     """
@@ -209,6 +257,8 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
     ----------
     I: ndarray(M, N, n_channels)
         Original image
+    device: str
+        Torch device
     n_sites: int
         Number of Voronoi sites
     n_neighbs: int
@@ -286,7 +336,10 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
         loss = 0
         Js = []
         for k, (i1, i2) in enumerate(splat_intervals):
-            J, _, _ = get_site_colors_and_voronoi_img(torch.sigmoid(vcoords[i1:i2, :]), I, n_neighbs, temperature)
+            vcoordsk = torch.sigmoid(vcoords[i1:i2, :])
+            nn_idx, weights = get_nn_weights(vcoordsk, I.shape, n_neighbs, device, temperature)
+            colors, _ = get_avg_colors(I, vcoords, nn_idx)
+            J = splat_colors(nn_idx, weights, colors, I.shape, device)
             Js.append(J)
             img_cost = torch.sum((I-J)**2)
             loss += img_cost
@@ -331,7 +384,9 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
             print("Iteration {}, Loss {:.3f}, Elapsed Time: {:.3f}".format(i, loss.item(), time.time()-tic))
     
     vcoords = torch.sigmoid(vcoords)
-    J, colors, colors_valid = get_site_colors_and_voronoi_img(vcoords, I, n_neighbs, temperature)
+    nn_idx, weights = get_nn_weights(vcoords, I.shape, n_neighbs, device, temperature)
+    colors, _ = get_avg_colors(I, vcoords, nn_idx)
+    J = splat_colors(nn_idx, weights, colors, I.shape, device)
     final_cost = torch.sum((I-J)**2)
     # Stack up vcoords and colors in columns and keep only valid ones
     colors_valid = colors_valid.flatten()
