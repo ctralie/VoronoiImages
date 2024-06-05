@@ -87,7 +87,7 @@ def splat_voronoi_image_1nn(Y, M, N):
     X = np.array([xpix, ypix]).T
 
     tree = KDTree(Y[:, 0:2])
-    _, idx = tree.query(X, k=1) # Nearest landmark indices to pixels
+    _, idx = tree.query(X, k=1, workers=-1) # Nearest landmark indices to pixels
     idx = idx.flatten()
     J = Y[idx, 2::]
     J = np.reshape(J, (M, N, 3))
@@ -176,10 +176,10 @@ def get_nn_weights(vcoords, shape, n_neighbs, device, temperature=20):
     weights = torch.zeros(np.prod(shape[0:-1]), n_neighbs).to(device)
     for i in range(n_neighbs):
         dX = vcoords[nn_idx[:, i], :] - X
-        weights[:, i] = 1/(1e-4+torch.sum(dX**2, dim=1))
-    mx = torch.max(weights, dim=1).values
-    mx = mx.view(mx.numel(), 1)
-    weights = torch.exp(temperature*weights/mx)
+        weights[:, i] = torch.sum(dX**2, dim=1)
+    mn = torch.max(weights, dim=1).values
+    mn = mn.view(mn.numel(), 1)
+    weights = torch.exp(-temperature*weights/mn)
     weights = weights/torch.sum(weights, dim=1, keepdims=True)
 
     return nn_idx, weights
@@ -385,7 +385,7 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
     
     vcoords = torch.sigmoid(vcoords)
     nn_idx, weights = get_nn_weights(vcoords, I.shape, n_neighbs, device, temperature)
-    colors, _ = get_avg_colors(I, vcoords, nn_idx)
+    colors, colors_valid = get_avg_colors(I, vcoords, nn_idx)
     J = splat_colors(nn_idx, weights, colors, I.shape, device)
     final_cost = torch.sum((I-J)**2)
     # Stack up vcoords and colors in columns and keep only valid ones
