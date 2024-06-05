@@ -87,7 +87,7 @@ def splat_voronoi_image_1nn(Y, M, N):
     X = np.array([xpix, ypix]).T
 
     tree = KDTree(Y[:, 0:2])
-    _, idx = tree.query(X, k=1, workers=-1) # Nearest landmark indices to pixels
+    _, idx = tree.query(X, k=1) # Nearest landmark indices to pixels
     idx = idx.flatten()
     J = Y[idx, 2::]
     J = np.reshape(J, (M, N, 3))
@@ -176,10 +176,9 @@ def get_nn_weights(vcoords, shape, n_neighbs, device, temperature=20):
     weights = torch.zeros(np.prod(shape[0:-1]), n_neighbs).to(device)
     for i in range(n_neighbs):
         dX = vcoords[nn_idx[:, i], :] - X
-        weights[:, i] = torch.sum(dX**2, dim=1)
-    mn = torch.max(weights, dim=1).values
-    mn = mn.view(mn.numel(), 1)
-    weights = torch.exp(-temperature*weights/mn)
+        weights[:, i] = 1/(1e-4+torch.sum(dX**2, dim=1))
+    mx = weights[:, 0].view(weights.shape[0], 1)
+    weights = torch.exp(temperature*weights/mx)
     weights = weights/torch.sum(weights, dim=1, keepdims=True)
 
     return nn_idx, weights
