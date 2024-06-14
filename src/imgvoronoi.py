@@ -1,3 +1,8 @@
+"""
+Programmer: Chris Tralie
+Purpose: Voronoi images/video
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 import time
@@ -167,7 +172,7 @@ def get_nn_weights(vcoords, shape, n_neighbs, device, temperature=20):
 
     ## Step 2: Compute distance from all pixels to landmarks
     tree = KDTree(vcoords.detach().cpu().numpy())
-    _, nn_idx = tree.query(X.detach().cpu().numpy(), k=n_neighbs) # Nearest landmark indices to pixels
+    _, nn_idx = tree.query(X.detach().cpu().numpy(), k=n_neighbs, workers=-1) # Nearest landmark indices to pixels
     if n_neighbs == 1:
         nn_idx = nn_idx[:, None]
 
@@ -343,12 +348,11 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
             img_cost = torch.sum((I-J)**2)
             loss += img_cost
             img_costs[k].append(img_cost.item())
-            """
-            from videoutils import save_video
-            J = J.detach().cpu().numpy()
-            J = np.array(np.floor(J*255), dtype=np.uint8)
-            save_video("Iter{}.avi".format(i), J)
-            """
+            if len(J.shape) == 4:
+                from videoutils import save_video
+                J = J.detach().cpu().numpy()
+                J = np.array(np.floor(J*255), dtype=np.uint8)
+                save_video("Iter{}.avi".format(i), J)
         loss.backward()
         optimizer.step()
 
