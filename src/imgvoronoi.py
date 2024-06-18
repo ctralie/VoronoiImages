@@ -253,7 +253,7 @@ def splat_colors(nn_idx, weights, colors, shape, device):
     J = J.view(shape)
     return J
 
-def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=50, lr=2e-2, splat_intervals=[], plot_iter_interval=0, verbose=False):
+def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=50, lr=1e-3, splat_intervals=[], plot_iter_interval=0, verbose=False):
     """
     Compute a set of Voronoi sites best fit to an image
 
@@ -318,7 +318,6 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
     idx_perm, _ = get_greedy_perm(vcoords)
     vcoords = vcoords[idx_perm, :]
     vcoords = torch.from_numpy(vcoords)
-    vcoords = torch.log(vcoords/(1-vcoords)) # Do logit (inverse sigmoid)
     vcoords = vcoords.to(device)
     vcoords = vcoords.requires_grad_()
 
@@ -329,7 +328,6 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
     plot_rows = int(np.ceil(len(splat_intervals)/2.0))
     plot_cols = int(np.ceil(2*len(splat_intervals)/plot_rows))
     plot_rows += 1
-    print("plot_rows", plot_rows, ", plot_cols", plot_cols)
     if plot_iter_interval > 0:
         plt.figure(figsize=(plot_cols*5, plot_rows*5))
     plot_idx = 0
@@ -340,15 +338,14 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
         loss = 0
         Js = []
         for k, (i1, i2) in enumerate(splat_intervals):
-            vcoordsk = torch.sigmoid(vcoords[i1:i2, :])
-            nn_idx, weights = get_nn_weights(vcoordsk, I.shape, n_neighbs, device, temperature)
-            colors, _ = get_avg_colors(I, vcoords, nn_idx)
+            nn_idx, weights = get_nn_weights(vcoords[i1:i2, :], I.shape, n_neighbs, device, temperature)
+            colors, _ = get_avg_colors(I, vcoords[i1:i2, :], nn_idx)
             J = splat_colors(nn_idx, weights, colors, I.shape, device)
             Js.append(J)
             img_cost = torch.sum((I-J)**2)
             loss += img_cost
             img_costs[k].append(img_cost.item())
-            if len(J.shape) == 4:
+            if len(J.shape) == 4 and i%10 == 0:
                 from videoutils import save_video
                 J = J.detach().cpu().numpy()
                 J = np.array(np.floor(J*255), dtype=np.uint8)
@@ -386,7 +383,6 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
         if verbose:
             print("Iteration {}, Loss {:.3f}, Elapsed Time: {:.3f}".format(i, loss.item(), time.time()-tic))
     
-    vcoords = torch.sigmoid(vcoords)
     nn_idx, weights = get_nn_weights(vcoords, I.shape, n_neighbs, device, temperature)
     colors, colors_valid = get_avg_colors(I, vcoords, nn_idx)
     J = splat_colors(nn_idx, weights, colors, I.shape, device)
