@@ -253,7 +253,7 @@ def splat_colors(nn_idx, weights, colors, shape, device):
     J = J.view(shape)
     return J
 
-def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=50, lr=1e-3, splat_intervals=[], plot_iter_interval=0, verbose=False):
+def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=50, lr=1e-3, plot_iter_interval=0, verbose=False):
     """
     Compute a set of Voronoi sites best fit to an image
 
@@ -273,9 +273,6 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
         Number of iterations of gradient descent
     lr: float
         Learning rate
-    splat_intervals: list
-        List of (i1, i2) of the intervals of points in which to accumulate Voronoi splatting loss.
-        If the list is empty, just do Voronoi splatting once on the whole thing
     plot_iter_interval: int
         If > 0, make a plot showing the gradient descent every time this number of iterations passes
     verbose: bool
@@ -293,8 +290,6 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
         Final error of the optimization
     """
     import torch
-    if len(splat_intervals) == 0:
-        splat_intervals = [(0, n_sites)]
     ## Step 1: Load Images
     if np.issubdtype(I.dtype, np.integer):
         I = I/255
@@ -323,13 +318,9 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
 
     ## Step 3: Do the regression!
     optimizer = torch.optim.Adam([vcoords], lr=lr)
-    img_costs   = [[] for _ in range(len(splat_intervals))]
-
-    plot_rows = int(np.ceil(len(splat_intervals)/2.0))
-    plot_cols = int(np.ceil(2*len(splat_intervals)/plot_rows))
-    plot_rows += 1
+    img_costs   = []
     if plot_iter_interval > 0:
-        plt.figure(figsize=(plot_cols*5, plot_rows*5))
+        plt.figure(figsize=(15, 5))
     plot_idx = 0
 
     for i in range(n_iters):
@@ -337,47 +328,45 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
         optimizer.zero_grad()
         loss = 0
         Js = []
-        for k, (i1, i2) in enumerate(splat_intervals):
-            nn_idx, weights = get_nn_weights(vcoords[i1:i2, :], I.shape, n_neighbs, device, temperature)
-            colors, _ = get_avg_colors(I, vcoords[i1:i2, :], nn_idx)
-            J = splat_colors(nn_idx, weights, colors, I.shape, device)
-            Js.append(J)
-            img_cost = torch.sum((I-J)**2)
-            loss += img_cost
-            img_costs[k].append(img_cost.item())
-            if len(J.shape) == 4 and i%10 == 0:
+        nn_idx, weights = get_nn_weights(vcoords, I.shape, n_neighbs, device, temperature)
+        colors, _ = get_avg_colors(I, vcoords, nn_idx)
+        J = splat_colors(nn_idx, weights, colors, I.shape, device)
+        Js.append(J)
+        pix_diffs = (I-J)**2
+        img_cost = torch.sum(pix_diffs)
+        loss += img_cost
+        img_costs.append(img_cost.item())
+        loss.backward()
+        optimizer.step()
+
+        ## Make plots showing progress if requested
+        if plot_iter_interval > 0 and i % plot_iter_interval == 0:
+            if len(J.shape) == 4:
                 from videoutils import save_video
                 J = J.detach().cpu().numpy()
                 J = np.array(np.floor(J*255), dtype=np.uint8)
                 save_video("Iter{}.avi".format(i), J)
-        loss.backward()
-        optimizer.step()
-
-        ## Make plots showing progress if requested (assuming 2D image)
-        if plot_iter_interval > 0 and i % plot_iter_interval == 0:
-            M, N = I.shape[0], I.shape[1]
-            xydisp = torch.sigmoid(vcoords).detach().cpu().numpy()
-            plt.clf()
-            for k, (J, (i1, i2)) in enumerate(zip(Js, splat_intervals)):
-                plt.subplot(plot_rows, plot_cols, k*2+1)
+            else:
+                M, N = I.shape[0], I.shape[1]
+                xydisp = vcoords.detach().cpu().numpy()
+                plt.clf()
+                plt.subplot(131)
                 plt.imshow(I_orig, aspect='auto')
                 plt.axis("off")
-                plt.scatter(xydisp[i1:i2, 1]*N, xydisp[i1:i2, 0]*M, s=1)
-                plt.title("({}, {})".format(i1, i2))
+                plt.scatter(xydisp[:, 1]*N, xydisp[:, 0]*M, s=1)
                 
-                plt.subplot(plot_rows, plot_cols, k*2+2)
+                plt.subplot(132)
                 J = J.detach().cpu().numpy()
                 plt.imshow(J, aspect='auto')
                 plt.axis("off")
-                plt.title("{:.3f}".format(img_costs[k][-1]))
+                plt.title("{:.3f}".format(img_costs[-1]))
 
-                plt.subplot(plot_rows, plot_cols, 2*plot_cols+k+1)
-                plt.plot(img_costs[k])
+                plt.subplot(133)
+                plt.plot(img_costs)
                 plt.xlabel("Iteration")
-                if k == 0:
-                    plt.ylabel("Loss")
-                plt.title("({}, {}), {:.3f}".format(i1, i2, img_costs[k][-1]))
-            plt.savefig("Voronoi{}.png".format(plot_idx), bbox_inches='tight')
+                plt.ylabel("Loss")
+                plt.title("{:.3f}".format(img_costs[-1]))
+                plt.savefig("Voronoi{}.png".format(plot_idx), bbox_inches='tight')
             plot_idx += 1
 
         if verbose:
