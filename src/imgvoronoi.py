@@ -253,18 +253,19 @@ def splat_colors(nn_idx, weights, colors, shape, device):
     J = J.view(shape)
     return J
 
-def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=50, lr=1e-3, plot_iter_interval=0, verbose=False):
+def get_voronoi_image(I, device, sites, n_neighbs=2, temperature=20, n_iters=50, lr=1e-3, plot_iter_interval=0, verbose=False):
     """
     Compute a set of Voronoi sites best fit to an image
 
     Parameters
     ----------
-    I: ndarray(M, N, n_channels)
+    I: ndarray(M, N, ..., n_channels)
         Original image
     device: str
         Torch device
-    n_sites: int
-        Number of Voronoi sites
+    vcoords: int or ndarray(n_sites, dim)
+        If int, this is the number of sites to start with
+        Otherwise, start with these sites
     n_neighbs: int
         Number of nearest neighbors to use in the voronoi diagram (default 2)
     temperature: float
@@ -302,16 +303,15 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
         assert(IGray.shape[2] >= 3) # If it has more than one, it should have at least 3 channels
         IGray = 0.2125*IGray[..., 0] + 0.7154*IGray[..., 1] + 0.0721*IGray[..., 2]
     
-    ## Step 2: Compute weights and sample randomly according to them
-    # Chop off boundaries of each axis to make sure we don't choose points there, to
-    # avoid singularities with logit
-    weights = sobel(IGray)
-    for i in range(len(weights.shape)):
-        weights = np.take(weights, np.arange(1, weights.shape[i]-1), axis=i)
-    vcoords = stochastic_universal_sample(weights, n_sites) + 1
-    vcoords /= (np.array(IGray.shape)-1)[None, :]
-    idx_perm, _ = get_greedy_perm(vcoords)
-    vcoords = vcoords[idx_perm, :]
+    ## Step 2: Compute initial locations of sites
+    vcoords = sites
+    if type(sites) is int:
+        # If sites haven't been specified, compute weights and sample randomly accordingly
+        weights = sobel(IGray)
+        vcoords = stochastic_universal_sample(weights, sites)
+        vcoords /= np.array(IGray.shape)[None, :]
+        idx_perm, _ = get_greedy_perm(vcoords)
+        vcoords = vcoords[idx_perm, :]
     vcoords = torch.from_numpy(vcoords)
     vcoords = vcoords.to(device)
     vcoords = vcoords.requires_grad_()
@@ -369,7 +369,7 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
                 plt.savefig("Voronoi{}.png".format(plot_idx), bbox_inches='tight')
             plot_idx += 1
 
-        if verbose:
+        if verbose and i%10 == 0:
             print("Iteration {}, Loss {:.3f}, Elapsed Time: {:.3f}".format(i, loss.item(), time.time()-tic))
     
     nn_idx, weights = get_nn_weights(vcoords, I.shape, n_neighbs, device, temperature)
@@ -385,3 +385,13 @@ def get_voronoi_image(I, device, n_sites, n_neighbs=2, temperature=20, n_iters=5
     valid_idxs = np.bitwise_and(valid_idxs, colors_valid)
     X = X[valid_idxs == 1, :]
     return J.detach().cpu().numpy(), X, final_cost.item()
+
+def get_compression_ratio(I, n_sites):
+    """
+    Print information about compression ratio
+    """
+    dim = len(I.shape)-1
+    print("Compression ratio", I.size/(n_sites*(dim+3))) #xy..rgb
+    print("{} kB".format(n_sites*6/1024))
+    print("{} bpp".format(n_sites*6*8/np.prod(I.shape[0:3])))
+    print("{:.3f} % of pixels".format(100*n_sites/I.size))
