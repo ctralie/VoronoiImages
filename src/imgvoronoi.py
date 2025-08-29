@@ -165,7 +165,7 @@ def get_nn_weights(vcoords, shape, n_neighbs, device, temperature=20):
     from scipy.spatial import KDTree
     ## Step 1: Setup grid of pixels
     if not shape in X_GRIDS:
-        X = torch.meshgrid(*[torch.linspace(0, 1, n) for n in shape[0:-1]], indexing='ij')
+        X = torch.meshgrid(*[1.0*torch.arange(n) for n in shape[0:-1]], indexing='ij')
         X = torch.concatenate(tuple([Xi.unsqueeze(-1) for Xi in X]), dim=-1).flatten(0, -2).to(device)
         X_GRIDS[shape] = X # Cache for future iterations since this doesn't change
     X = X_GRIDS[shape]
@@ -200,7 +200,6 @@ def get_avg_colors(I, vcoords, nn_idx):
         Coordinates of voronoi sites
     nn_idx: ndarray(M*N*..., n_neighbs)
         Indices of k-nearest neighbors for each pixel/voxel
-    weights: torch.tensor(M*N*..., n_neighbs)
 
     Returns
     -------
@@ -253,7 +252,7 @@ def splat_colors(nn_idx, weights, colors, shape, device):
     J = J.view(shape)
     return J
 
-def get_voronoi_image(I, device, sites, n_neighbs=2, temperature=20, n_iters=50, lr=1e-3, plot_iter_interval=0, verbose=False):
+def get_voronoi_image(I, device, sites, n_neighbs=2, temperature=20, n_iters=50, lr=1, plot_iter_interval=0, verbose=False):
     """
     Compute a set of Voronoi sites best fit to an image
 
@@ -263,9 +262,9 @@ def get_voronoi_image(I, device, sites, n_neighbs=2, temperature=20, n_iters=50,
         Original image
     device: str
         Torch device
-    vcoords: int or ndarray(n_sites, dim)
-        If int, this is the number of sites to start with
-        Otherwise, start with these sites
+    sites: int or ndarray(n_sites, dim)
+        If int, this is the number of sites to randomly sample from a Sobel image
+        Otherwise, start with the specified sites
     n_neighbs: int
         Number of nearest neighbors to use in the voronoi diagram (default 2)
     temperature: float
@@ -308,8 +307,8 @@ def get_voronoi_image(I, device, sites, n_neighbs=2, temperature=20, n_iters=50,
     if type(sites) is int:
         # If sites haven't been specified, compute weights and sample randomly accordingly
         weights = sobel(IGray)
-        vcoords = stochastic_universal_sample(weights, sites)
-        vcoords /= np.array(IGray.shape)[None, :]
+        vcoords = stochastic_universal_sample(weights, sites)*1.0
+        # Sort by a greedy permutation so they can be displayed incrementally in a video
         idx_perm, _ = get_greedy_perm(vcoords)
         vcoords = vcoords[idx_perm, :]
     vcoords = torch.from_numpy(vcoords)
