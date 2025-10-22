@@ -35,6 +35,31 @@ def get_circumcenters(X, simplices):
 
     return centers
 
+
+def sdf_to_tsdf(sdf, thresh):
+    """
+    Convert a signed distance function to a truncated signed distance function.
+    This is a general purpose function for SDFs in any dimension
+
+    Parameters
+    ----------
+    sdf: ndarray (...)
+        A signed distance function
+    thresh: float
+        Distance threshold beyond which to exclude data
+    
+    Returns
+    -------
+    tsdf: ndarray (...)
+        The truncated signed distance function.  NaNs indicate data outside
+        of the scanned range
+    """
+    tsdf = np.nan*np.ones_like(sdf)
+    sel = np.abs(sdf) < thresh
+    tsdf[sel] = sdf[sel]
+    return tsdf
+
+
 def estimate_scan_normals(X, pos, k=10):
     """
     Compute the normals at every point of a scan, using the camera
@@ -211,7 +236,7 @@ def ray_intersect_curve(p0, v, X):
             p = p0 + t*v
     return {'t':tmin, 'p':p}
 
-def get_sdf(X, N, G):
+def get_sdf_2d(X, N, G):
     """
     Compute a discretized distance function of a set of connected
     components on a sampled curve
@@ -241,8 +266,254 @@ def get_sdf(X, N, G):
     dX = G - grid_nn
     return np.sign(np.sum(dX*grid_normals, axis=1))*dists_i
 
+def get_curv_vectors(X, MaxOrder, sigma, loop = False, m = 'nearest'):
+    """
+    Get smoothed curvature vectors up to a particular order
+    
+    Parameters
+    ----------
+    X: ndarray(N, d)
+        An N x d matrix of points in R^d
+    MaxOrder: int
+        The maximum order of torsion to compute (e.g. 3 for position, velocity, and curvature, and torsion)
+    sigma: float
+        The smoothing amount
+    loop: boolean
+        Whether to treat this trajectory as a topological loop (i.e. add an edge between first and last point)
+    
+    Returns
+    -------
+    Curvs: A list of (N, 3) arrays, starting with the smoothed curve, then followed
+           by the smoothed velocity, curvature, torsion, etc. up to the MaxOrder
+    """
+    from scipy.ndimage.filters import gaussian_filter1d as gf1d
+    if loop:
+        m = 'wrap'
+    XSmooth = gf1d(X, sigma, axis=0, order = 0, mode = m)
+    Vel = gf1d(X, sigma, axis=0, order = 1, mode = m)
+    VelNorm = np.sqrt(np.sum(Vel**2, 1))
+    VelNorm[VelNorm == 0] = 1
+    Curvs = [XSmooth, Vel]
+    for order in range(2, MaxOrder+1):
+        Tors = gf1d(X, sigma, axis=0, order=order, mode = m)
+        for j in range(1, order):
+            #Project away other components
+            NormsDenom = np.sum(Curvs[j]**2, 1)
+            NormsDenom[NormsDenom == 0] = 1
+            Norms = np.sum(Tors*Curvs[j], 1)/NormsDenom
+            Tors = Tors - Curvs[j]*Norms[:, None]
+        Tors = Tors/(VelNorm[:, None]**order)
+        Curvs.append(Tors)
+    return Curvs
+
+
+def reconstruct_signed_voronoi_2d(X, c):
+    """
+    Perform a signed Voronoi reconstruction of a 2D curve
+
+    Parameters
+    ----------
+    X: ndarray(N, 3)
+        Location of Voronoi sites
+    c: ndarray(N)
+        0/1 inside/outside designation of each site
+    
+    Returns
+    -------
+    centers: ndarray(n_centers, 3)
+        Locations of Voronoi vertices (i.e. Delaunay circumcenters)
+    edges: ndarray(n_edges, 2, dtype=int)
+        Edges between centers
+    """
+    from scipy.spatial import Delaunay
+    tri = Delaunay(X)
+    simplices = tri.simplices
+
+    ## Step 1: Figure out geometry
+    centers = get_circumcenters(X, simplices)
+
+    ## Step 2: Figure out topology
+    # Need to be able to quickly look up two involved triangles for an edge
+    edge2tris = {}
+    for i, simplex in enumerate(simplices):
+        for j in range(len(simplex)):
+            edge = [simplex[j], simplex[(j+1)%len(simplex)]]
+            edge = tuple(sorted(edge))
+            if not edge in edge2tris:
+                edge2tris[edge] = []
+            edge2tris[edge].append(i)
+    edges = []
+    for (e1, e2), tris in edge2tris.items():
+        # Only include edges between inside/outside, as well as non-boundary edges
+        if c[e1] != c[e2] and len(tris) == 2:
+            tri1, tri2 = tris
+            edges.append([tri1, tri2])
+    edges = np.array(edges, dtype=int)
+    
+    return centers, edges
+
+
+
 ######################################################
-#                  3D UTILITIES
+#              3D IMPLICIT UTILITIES
+######################################################
+
+def mask3d_to_gridpos(mask, xs, ys, zs):
+    """
+    Parameters
+    ----------
+    mask: ndarray(K, dtype=int)
+        Raveled indices into the sparse M1 x M2 x M3 grid implied 
+        by xs, ys, and zs at which to compute the sdf before truncating 
+        to the tsdf
+    xs: ndarray(M1)
+        x locations on a grid on which to sample the implicit function
+    ys: ndarray(M2)
+        y locations on a grid on which to sample the implicit function
+    zs: ndarray(M3)
+        z locations on a grid on which to sample the implicit function
+    
+    Returns
+    -------
+    ndarray(K, 3)
+        XYZ locations of grid points
+    """
+    xyz_idx = np.unravel_index(mask, (xs.size, ys.size, zs.size))
+    xyz_idx = np.array(xyz_idx).T
+    xyz = np.zeros(xyz_idx.shape)
+    for k, w in enumerate([xs, ys, zs]):
+        xyz[:, k] = w[xyz_idx[:, k]]
+    return xyz
+
+def get_tsdf_3d_masked(X, N, xs, ys, zs, thresh, mask, shrink_mask=True):
+    """
+    Compute a discretized truncated signed distance function (TSDF)
+    restricted to a mask for a point cloud in 3D
+
+    Parameters
+    ----------
+    X: ndarray(N, 3)
+        A point cloud in R^2
+    N: ndarray(N, 3)
+        The corresponding normals for X
+    xs: ndarray(M1)
+        x locations on a grid on which to sample the implicit function
+    ys: ndarray(M2)
+        y locations on a grid on which to sample the implicit function
+    zs: ndarray(M3)
+        z locations on a grid on which to sample the implicit function
+    thresh: float
+        Threshold distance at which to cutoff the tsdf
+    mask: ndarray(K, dtype=int)
+        Raveled indices into the sparse M1 x M2 x M3 grid implied 
+        by xs, ys, and zs at which to compute the sdf before truncating 
+        to the tsdf
+    shrink_mask: boolean
+        If true, shrink the mask to only include voxels that have a
+        distance that's within thresh.  If false, compute the sdf
+        on the entire mask
+    
+    Returns
+    -------
+    xyz: ndarray(K, 3, dtype=float)
+        Coordinates of the tsdf
+    tsdf: ndarray(K, dtype=float)
+        The signed implicit function for the surface
+    """
+    from sklearn.neighbors import NearestNeighbors
+    ## Step 1: Convert mask into xyz grid locations based on xs, ys, zs
+    xyz = mask3d_to_gridpos(mask, xs, ys, zs)
+    ## Step 2: Use a tree-based data structure to quickly query
+    ## nearest neighbors in the scan to all points on the grid
+    neighb = NearestNeighbors(n_neighbors=1)
+    neighb.fit(X)
+    dists_i, neighbs_idx = neighb.kneighbors(xyz, 1, return_distance=True)
+    neighbs_idx = neighbs_idx.flatten()
+    dists_i = dists_i.flatten()
+    ## Step 3: Compute the sdf at the grid points that are within
+    ## a (possibly shrunken) mask
+    if shrink_mask:
+        neighbs_idx = neighbs_idx[dists_i < thresh]
+        xyz = xyz[dists_i < thresh]
+        dists_i = dists_i[dists_i < thresh]
+    grid_nn = X[neighbs_idx, :]
+    grid_normals = N[neighbs_idx, :]
+    dX = xyz - grid_nn
+    tsdf = np.sign(np.sum(dX*grid_normals, axis=1))*dists_i
+    return xyz, tsdf
+
+def get_aabbox3d_mask(xs, ys, zs, mins, maxes):
+    """
+    Compute a mask based on an axis-aligned bounding box
+    TODO: Add capability for non axis aligned bounding boxes
+
+    Parameters
+    ----------
+    xs: ndarray(M1)
+        x locations on a grid on which to sample the implicit function
+    ys: ndarray(M2)
+        y locations on a grid on which to sample the implicit function
+    zs: ndarray(M3)
+        z locations on a grid on which to sample the implicit function
+    mins: [float, float float]
+        Bottom left of AABB
+    maxes: [float, float]
+        Upper right of AABB
+
+    Returns
+    -------
+    mask: ndarray(K, dtype=int)
+        The raveled indices into the sparse M1 x M2 x M3 grid at which
+        the tsdf values are specified.
+    """
+    # Figure out indices of this aabb into full grid
+    idxs = []
+    for k, w in enumerate([xs, ys, zs]):
+        min, max = mins[k], maxes[k]
+        idx = np.arange(w.size)[(w >= min)*(w <= max)]
+        idxs.append(idx)
+    x, y, z = [w.flatten() for w in np.meshgrid(*idxs, indexing='ij')]
+    return np.ravel_multi_index((x, y, z), (xs.size, ys.size, zs.size))
+
+
+def get_tsdf_3d(X, N, xs, ys, zs, thresh):
+    """
+    Compute a discretized truncated signed distance function (TSDF) for a point 
+    cloud in 3D.  For speed, narrow down to the voxels in the point cloud's
+    axis-aligned bounding box expanded by "thresh"
+
+    Parameters
+    ----------
+    X: ndarray(N, 3)
+        A point cloud in R^2
+    N: ndarray(N, 3)
+        The corresponding normals for X
+    xs: ndarray(M1)
+        x locations on a grid on which to sample the implicit function
+    ys: ndarray(M2)
+        y locations on a grid on which to sample the implicit function
+    zs: ndarray(M3)
+        z locations on a grid on which to sample the implicit function
+    thresh: float
+        Threshold distance at which to cutoff the tsdf
+    
+    Returns
+    -------
+    xyz: ndarray(K, 3, dtype=float)
+        Coordinates of the tsdf
+    tsdf: ndarray(K, dtype=float)
+        The signed implicit function for the surface
+    """
+    # Narrow down mask to an axis-aligned bounding box expanded by thresh
+    mins = np.min(X, axis=0) - thresh
+    maxes = np.max(X, axis=0) + thresh
+    mask = get_aabbox3d_mask(xs, ys, zs, mins, maxes)
+    return get_tsdf_3d_masked(X, N, xs, ys, zs, thresh, mask)
+
+
+
+######################################################
+#                  3D I/O UTILITIES
 ######################################################
 
 def load_off_file(filename):
