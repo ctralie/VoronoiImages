@@ -3,6 +3,7 @@ from scipy import sparse
 from scipy.spatial import Delaunay
 import skimage
 import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon
 
 NULL_HALF_EDGE = -1
 BOUNDARY_HALF_EDGE = -1
@@ -64,19 +65,23 @@ class HalfEdgeMesh:
         self.he_prev = np.concatenate((self.he_prev, np.zeros(n_new_he, dtype=int)))
         self.he_prev[self.vertex_to_he[y]] = exterior_boundary_he
 
-    def get_vertex_neighbors(self, index: int) -> list[int]:
-        neighbors = []
+    def get_vertex_half_edges(self, index: int) -> list[int]:
+        hedges = []
         he_start = self.vertex_to_he[index]
         if he_start == NULL_HALF_EDGE:
-            return neighbors
+            return hedges
         he = he_start
         for _ in range(len(self.he_face)):
-            neighbors.append(self.he_tip[he])
+            hedges.append(he)
             # he = self.he_next[self.he_pair[he]] # Walks clockwise
             he = self.he_pair[self.he_prev[he]] # Walks counter-clockwise
             if he == he_start:
                 break
-        return neighbors
+        return hedges
+
+    def get_vertex_neighbors(self, index: int) -> list[int]:
+        hedges = self.get_vertex_half_edges(index)
+        return [self.he_tip[he] for he in hedges]
 
 
 class DynamicVoronoi(HalfEdgeMesh):
@@ -87,25 +92,55 @@ class DynamicVoronoi(HalfEdgeMesh):
         super().__init__(vertices, tris)
 
         centers = self.circumcenters_and_radii2()[0]
+        colors = np.zeros((vertices.shape[0], 3))
+        counts = np.zeros(vertices.shape[0])
 
         self.image = image
+        self.image_dx = np.cumsum(image, axis=1)
 
-        plt.imshow(image)
+
         for he in range(len(self.he_tip)):
             a = centers[he]
             b = centers[self.he_pair[he]]
-            vec = b - a
-            perp = np.array([-vec[1], vec[0]])
-            perp = perp / np.linalg.norm(perp)
-            a -= 5*perp
-            b -= 5*perp
-            # [x, y] -> [-y, x]
+            vertex_index = self.he_tip[he]
             if self.he_face[he] == -1 or self.he_face[self.he_pair[he]] == -1:
                 continue
-            c = "C0"
+            sign = 1
             if b[0] < a[0]:
-                c = "C1"
-            plt.plot([a[0], b[0]], [a[1], b[1]], c=c)
+                sign = -1
+                a, b = b, a
+            i1 = int(np.floor(a[0]))
+            j1 = int(np.round(a[1]))
+            i2 = int(np.ceil(b[0]))
+            j2 = int(np.round(b[1]))
+            slope = (j2 - j1) / (i2 - i1)
+            if i1 < 0 or i2 < 0 or i1 > image.shape[0]-1 or i2 > image.shape[0]-1:
+                continue
+            for i in range(i1, i2+1):
+                j = int(np.round((i - i1) * slope))
+                j = max(min(j, image.shape[1]-1), 0)
+                colors[vertex_index] += sign*self.image_dx[i, j]
+                counts[vertex_index] += sign*j
+        colors = colors / counts[:, None]
+
+        polygons = []
+        for i in range(len(vertices)):
+            hedges = self.get_vertex_half_edges(i)
+            hedges = np.array(hedges, dtype=int)
+            polygons.append(centers[hedges])
+
+        plt.imshow(image)
+        for polygon, color in zip(polygons, colors):
+            color = np.clip(color, 0, 1)
+            poly = Polygon(
+                polygon,
+                closed=True,  # automatically closes the shape
+                facecolor=color,  # interior color
+                edgecolor=None,  # border colour
+                linewidth=0,
+                alpha=1  # transparency (0‑1)
+            )
+            plt.gca().add_patch(poly)
 
         plt.xlim([0, image.shape[1]])
         plt.ylim([image.shape[0], 0])
@@ -145,11 +180,13 @@ class DynamicVoronoi(HalfEdgeMesh):
 
 
 def main() -> None:
-    image = skimage.io.imread("data/images/layla.png")
+    image = skimage.io.imread("layla.png")
+    image = image.astype(np.float32) / 255
     n_sites = 100
+    np.random.seed(0)
     vertices = np.random.rand(n_sites, 2)
-    vertices[:, 0] *= image.shape[1]
-    vertices[:, 1] *= image.shape[0]
+    vertices[:, 0] *= image.shape[0]
+    vertices[:, 1] *= image.shape[1]
     voronoi = DynamicVoronoi(image, vertices)
 
 if __name__ == '__main__':
