@@ -86,7 +86,12 @@ class HalfEdgeMesh:
 
 class DynamicVoronoi(HalfEdgeMesh):
     def __init__(self, image: np.ndarray, vertices: np.ndarray) -> None:
-        ## TODO: Enforce CCW order of simplices
+        n_real = vertices.shape[0]
+        height, width = image.shape[0], image.shape[1]
+        r = 10 * max(height, width)
+        cy, cx = height / 2, width / 2
+        ghosts = np.array([[cy - r, cx - r], [cy - r, cx + r], [cy + r, cx - r], [cy + r, cx + r]])
+        vertices = np.vstack((vertices, ghosts))
         tris = Delaunay(vertices).simplices
         self._make_ccw(vertices, tris)
         super().__init__(vertices, tris)
@@ -96,35 +101,32 @@ class DynamicVoronoi(HalfEdgeMesh):
         counts = np.zeros(vertices.shape[0])
 
         self.image = image
-        self.image_dx = np.cumsum(image, axis=1)
-
+        self.image_dx = np.concatenate((np.zeros((height, 1, image.shape[2]), image.dtype),
+                                        np.cumsum(image, axis=1)), axis=1)
 
         for he in range(len(self.he_tip)):
-            a = centers[he]
-            b = centers[self.he_pair[he]]
-            vertex_index = self.he_tip[he]
             if self.he_face[he] == -1 or self.he_face[self.he_pair[he]] == -1:
                 continue
+            a, b = centers[he], centers[self.he_pair[he]]
             sign = 1
             if b[0] < a[0]:
                 sign = -1
                 a, b = b, a
-            i1 = int(np.floor(a[0]))
-            j1 = int(np.round(a[1]))
-            i2 = int(np.ceil(b[0]))
-            j2 = int(np.round(b[1]))
-            slope = (j2 - j1) / (i2 - i1)
-            if i1 < 0 or i2 < 0 or i1 > image.shape[0]-1 or i2 > image.shape[0]-1:
+            i_lo = max(int(np.ceil(a[0] - 0.5)), 0)
+            i_hi = min(int(np.ceil(b[0] - 0.5)), height)
+            if i_hi <= i_lo:
                 continue
-            for i in range(i1, i2+1):
-                j = int(np.round((i - i1) * slope))
-                j = max(min(j, image.shape[1]-1), 0)
-                colors[vertex_index] += sign*self.image_dx[i, j]
-                counts[vertex_index] += sign*j
-        colors = colors / counts[:, None]
+            i = np.arange(i_lo, i_hi)
+            y = a[1] + (i + 0.5 - a[0]) * (b[1] - a[1]) / (b[0] - a[0])
+            js = np.clip(np.round(y).astype(int), 0, width)  # pixels left of the boundary
+            v = self.he_tip[he]
+            colors[v] += sign * np.sum(self.image_dx[i, js], axis=0)
+            counts[v] += sign * js.sum()
+        colors = colors[:n_real] / counts[:n_real, None]
+        self.colors = colors
 
         polygons = []
-        for i in range(len(vertices)):
+        for i in range(n_real):
             hedges = self.get_vertex_half_edges(i)
             hedges = np.array(hedges, dtype=int)
             polygons.append(centers[hedges])
@@ -147,7 +149,8 @@ class DynamicVoronoi(HalfEdgeMesh):
 
         plt.show()
 
-    def _make_ccw(self, vertices: np.ndarray, tris: np.ndarray) -> None:
+    @staticmethod
+    def _make_ccw(vertices: np.ndarray, tris: np.ndarray) -> None:
         a = vertices[tris[:, 0]]
         b = vertices[tris[:, 1]]
         c = vertices[tris[:, 2]]
@@ -155,10 +158,9 @@ class DynamicVoronoi(HalfEdgeMesh):
         ac = np.hstack((c - a, np.zeros((c.shape[0], 1))))
         n = np.cross(ab, ac)
         violating = np.where(n[:, -1] < 0)[0]
-        print(violating)
         if violating.size > 0:
             tris[violating] = tris[violating, ::-1]
-    
+
     def circumcenters_and_radii2(self):
         """Circumcenters and squared circumradii for triangles."""
         he = np.arange(len(self.he_tip))
@@ -169,6 +171,7 @@ class DynamicVoronoi(HalfEdgeMesh):
         bx, by = p1[:, 0], p1[:, 1]
         cx, cy = p2[:, 0], p2[:, 1]
 
+
         d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
         ux = ((ax**2 + ay**2) * (by - cy) + (bx**2 + by**2) * (cy - ay)
               + (cx**2 + cy**2) * (ay - by)) / d
@@ -177,7 +180,6 @@ class DynamicVoronoi(HalfEdgeMesh):
         centers = np.stack([ux, uy], axis=1)
         r2 = np.sum((centers - p0) ** 2, axis=1)
         return centers, r2
-
 
 def main() -> None:
     image = skimage.io.imread("layla.png")
