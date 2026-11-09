@@ -133,7 +133,7 @@ class DynamicVoronoi(HalfEdgeMesh):
         for polygon, color in zip(polygons, colors):
             color = np.clip(color, 0, 1)
             poly = Polygon(
-                polygon,
+                polygon[:, ::-1],
                 closed=True,  # automatically closes the shape
                 facecolor=color,  # interior color
                 edgecolor=None,  # border colour
@@ -182,7 +182,7 @@ class DynamicVoronoi(HalfEdgeMesh):
 def main() -> None:
     image = skimage.io.imread("layla.png")
     image = image.astype(np.float32) / 255
-    n_sites = 100
+    n_sites = 1000
     np.random.seed(0)
     vertices = np.random.rand(n_sites, 2)
     vertices[:, 0] *= image.shape[0]
