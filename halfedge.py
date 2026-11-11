@@ -4,11 +4,52 @@ from scipy.spatial import Delaunay
 import skimage
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
+from numba import njit
+import time
 
 NULL_HALF_EDGE = -1
 BOUNDARY_HALF_EDGE = -1
 BOUNDARY_FACE = -1
 N_GHOST_VERTICES = 4
+
+
+@njit(cache=True)
+def color_helper(
+    image_dx: np.ndarray,
+    centers: np.ndarray,
+    vertices: np.ndarray,
+    he_face: np.ndarray,
+    he_tip: np.ndarray,
+    he_pair: np.ndarray,
+) -> np.ndarray:
+    height = image_dx.shape[0]
+    width = image_dx.shape[1] - 1
+    colors = np.zeros((vertices.shape[0], 3))
+    counts = np.zeros(vertices.shape[0])
+    for he in range(len(he_tip)):
+        if he_face[he] == -1 or he_face[he_pair[he]] == -1:
+            continue
+        a, b = centers[he], centers[he_pair[he]]
+        sign = 1
+        if b[0] < a[0]:
+            sign = -1
+            a, b = b, a
+        i_lo = max(int(np.ceil(a[0] - 0.5)), 0)
+        i_hi = min(int(np.ceil(b[0] - 0.5)), height)
+        if i_hi <= i_lo:
+            continue
+        i = np.arange(i_lo, i_hi)
+        y = a[1] + (i + 0.5 - a[0]) * (b[1] - a[1]) / (b[0] - a[0])
+        js = np.round(y).astype(int)  # pixels left of the boundary
+        js[js < 0] = 0
+        js[js > width] = width
+        v = he_tip[he]
+        colors[v] += sign * np.sum(image_dx[i, js], axis=0)
+        counts[v] += sign * js.sum()
+    n_vertices = vertices.shape[0] - N_GHOST_VERTICES
+    colors = colors[:n_vertices] / counts[:n_vertices, None]
+    return colors
+
 
 class HalfEdgeMesh:
     def __init__(self, vertices: np.ndarray, tris: np.ndarray) -> None:
@@ -33,18 +74,21 @@ class HalfEdgeMesh:
         self._init_boundary()
 
     @staticmethod
-    def _init_pairs(tris: np.ndarray, he_index: np.ndarray, n_vertices: int) -> np.ndarray:
+    def _init_pairs(
+        tris: np.ndarray, he_index: np.ndarray, n_vertices: int
+    ) -> np.ndarray:
         n_half_edges = he_index.size
         rows = np.array([], dtype=int)
         cols = np.array([], dtype=int)
         indices = np.array([], dtype=int)
         for i in range(3):
             rows = np.concatenate((rows, tris[:, i]))
-            cols = np.concatenate((cols, tris[:, (i+1) % 3]))
+            cols = np.concatenate((cols, tris[:, (i + 1) % 3]))
             indices = np.concatenate((indices, he_index[:, i]))
         ## NOTE: Need to 1-index the sparse matrix so half edge 0 doesn't disappear
-        he_pair_mat_transpose = sparse.coo_matrix((indices+1, (rows, cols)),
-                                         shape=(n_vertices, n_vertices)).T.tocsr()
+        he_pair_mat_transpose = sparse.coo_matrix(
+            (indices + 1, (rows, cols)), shape=(n_vertices, n_vertices)
+        ).T.tocsr()
         he_pair = BOUNDARY_HALF_EDGE * np.ones(n_half_edges, int)
         he_pair[indices] = he_pair_mat_transpose[rows, cols] - 1
         return he_pair
@@ -53,10 +97,14 @@ class HalfEdgeMesh:
         interior_boundary_he = np.where(self.he_pair == BOUNDARY_HALF_EDGE)[0]
         n_half_edges = len(self.he_pair)
         n_new_he = len(interior_boundary_he)
-        self.he_face = np.concatenate((self.he_face, BOUNDARY_FACE*np.ones(n_new_he)))
+        self.he_face = np.concatenate((self.he_face, BOUNDARY_FACE * np.ones(n_new_he)))
         exterior_boundary_he = n_half_edges + np.arange(n_new_he)
-        self.he_pair = np.concatenate((self.he_pair, interior_boundary_he)) # exterior pair to interior
-        self.he_pair[interior_boundary_he] = exterior_boundary_he # interior pair to exterior
+        self.he_pair = np.concatenate(
+            (self.he_pair, interior_boundary_he)
+        )  # exterior pair to interior
+        self.he_pair[interior_boundary_he] = (
+            exterior_boundary_he  # interior pair to exterior
+        )
 
         x = self.he_tip[interior_boundary_he]
         self.vertex_to_he[x] = exterior_boundary_he
@@ -75,7 +123,7 @@ class HalfEdgeMesh:
         for _ in range(len(self.he_face)):
             hedges.append(he)
             # he = self.he_next[self.he_pair[he]] # Walks clockwise
-            he = self.he_pair[self.he_prev[he]] # Walks counter-clockwise
+            he = self.he_pair[self.he_prev[he]]  # Walks counter-clockwise
             if he == he_start:
                 break
         return hedges
@@ -90,19 +138,32 @@ class DynamicVoronoi(HalfEdgeMesh):
         height, width = image.shape[0], image.shape[1]
         r = 10 * max(height, width)
         cy, cx = height / 2, width / 2
-        ghosts = np.array([[cy - r, cx - r], [cy - r, cx + r], [cy + r, cx - r], [cy + r, cx + r]])
+        ghosts = np.array(
+            [[cy - r, cx - r], [cy - r, cx + r], [cy + r, cx - r], [cy + r, cx + r]]
+        )
         vertices = np.vstack((vertices, ghosts))
         tris = Delaunay(vertices).simplices
         self._make_ccw(vertices, tris)
         super().__init__(vertices, tris)
         self.image = image
-        self.image_dx = np.concatenate((np.zeros((height, 1, image.shape[2]), image.dtype),
-                                        np.cumsum(image, axis=1)), axis=1)
+        self.image_dx = np.concatenate(
+            (
+                np.zeros((height, 1, image.shape[2]), image.dtype),
+                np.cumsum(image, axis=1),
+            ),
+            axis=1,
+        )
 
     def plot(self) -> None:
+        tic = time.time()
         centers = self.circumcenters_and_radii2()[0]
+        print("Elapsed time centers:", time.time() - tic)
+        tic = time.time()
         polygons = self.get_voronoi_polygons(centers)
+        print("Elapsed time polygons:", time.time() - tic)
+        tic = time.time()
         colors = self.get_voronoi_colors(centers)
+        print("Elapsed time colors:", time.time() - tic)
         for polygon, color in zip(polygons, colors):
             color = np.clip(color, 0, 1)
             poly = Polygon(
@@ -111,7 +172,7 @@ class DynamicVoronoi(HalfEdgeMesh):
                 facecolor=color,  # interior color
                 edgecolor=None,  # border colour
                 linewidth=0,
-                alpha=1  # transparency (0‑1)
+                alpha=1,  # transparency (0‑1)
             )
             plt.gca().add_patch(poly)
         plt.xlim([0, self.image.shape[1]])
@@ -121,7 +182,7 @@ class DynamicVoronoi(HalfEdgeMesh):
         if centers is None:
             centers = self.circumcenters_and_radii2()[0]
         polygons = []
-        for i in range(len(self.vertices)-N_GHOST_VERTICES):
+        for i in range(len(self.vertices) - N_GHOST_VERTICES):
             hedges = self.get_vertex_half_edges(i)
             hedges = np.array(hedges, dtype=int)
             polygons.append(centers[hedges])
@@ -130,31 +191,15 @@ class DynamicVoronoi(HalfEdgeMesh):
     def get_voronoi_colors(self, centers: np.ndarray | None) -> np.ndarray:
         if centers is None:
             centers = self.circumcenters_and_radii2()[0]
-        height = self.image.shape[0]
-        width = self.image.shape[1]
-        colors = np.zeros((self.vertices.shape[0], 3))
-        counts = np.zeros(self.vertices.shape[0])
-        for he in range(len(self.he_tip)):
-            if self.he_face[he] == -1 or self.he_face[self.he_pair[he]] == -1:
-                continue
-            a, b = centers[he], centers[self.he_pair[he]]
-            sign = 1
-            if b[0] < a[0]:
-                sign = -1
-                a, b = b, a
-            i_lo = max(int(np.ceil(a[0] - 0.5)), 0)
-            i_hi = min(int(np.ceil(b[0] - 0.5)), height)
-            if i_hi <= i_lo:
-                continue
-            i = np.arange(i_lo, i_hi)
-            y = a[1] + (i + 0.5 - a[0]) * (b[1] - a[1]) / (b[0] - a[0])
-            js = np.clip(np.round(y).astype(int), 0, width)  # pixels left of the boundary
-            v = self.he_tip[he]
-            colors[v] += sign * np.sum(self.image_dx[i, js], axis=0)
-            counts[v] += sign * js.sum()
-        n_vertices = self.vertices.shape[0] - N_GHOST_VERTICES
-        colors = colors[:n_vertices] / counts[:n_vertices, None]
-        return colors
+
+        return color_helper(
+            self.image_dx,
+            centers,
+            self.vertices,
+            self.he_face,
+            self.he_tip,
+            self.he_pair,
+        )
 
     @staticmethod
     def _make_ccw(vertices: np.ndarray, tris: np.ndarray) -> None:
@@ -178,15 +223,21 @@ class DynamicVoronoi(HalfEdgeMesh):
         bx, by = p1[:, 0], p1[:, 1]
         cx, cy = p2[:, 0], p2[:, 1]
 
-
         d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
-        ux = ((ax**2 + ay**2) * (by - cy) + (bx**2 + by**2) * (cy - ay)
-              + (cx**2 + cy**2) * (ay - by)) / d
-        uy = ((ax**2 + ay**2) * (cx - bx) + (bx**2 + by**2) * (ax - cx)
-              + (cx**2 + cy**2) * (bx - ax)) / d
+        ux = (
+            (ax**2 + ay**2) * (by - cy)
+            + (bx**2 + by**2) * (cy - ay)
+            + (cx**2 + cy**2) * (ay - by)
+        ) / d
+        uy = (
+            (ax**2 + ay**2) * (cx - bx)
+            + (bx**2 + by**2) * (ax - cx)
+            + (cx**2 + cy**2) * (bx - ax)
+        ) / d
         centers = np.stack([ux, uy], axis=1)
         r2 = np.sum((centers - p0) ** 2, axis=1)
         return centers, r2
+
 
 def main() -> None:
     image = skimage.io.imread("layla.png")
@@ -197,8 +248,11 @@ def main() -> None:
     vertices[:, 0] *= image.shape[0]
     vertices[:, 1] *= image.shape[1]
     voronoi = DynamicVoronoi(image, vertices)
-    voronoi.plot()
-    plt.show()
 
-if __name__ == '__main__':
+    for _ in range(4):
+        voronoi.plot()
+        plt.show()
+
+
+if __name__ == "__main__":
     main()
