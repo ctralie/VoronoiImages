@@ -40,7 +40,7 @@ def color_helper(
             continue
         i = np.arange(i_lo, i_hi)
         y = a[1] + (i + 0.5 - a[0]) * (b[1] - a[1]) / (b[0] - a[0])
-        js = np.round(y).astype(int)  # pixels left of the boundary
+        js = np.asarray(y + 0.5, dtype=np.int32)  # pixels left of the boundary
         js[js < 0] = 0
         js[js > width] = width
         v = he_tip[he]
