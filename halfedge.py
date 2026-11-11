@@ -8,6 +8,7 @@ from matplotlib.patches import Polygon
 NULL_HALF_EDGE = -1
 BOUNDARY_HALF_EDGE = -1
 BOUNDARY_FACE = -1
+N_GHOST_VERTICES = 4
 
 class HalfEdgeMesh:
     def __init__(self, vertices: np.ndarray, tris: np.ndarray) -> None:
@@ -86,7 +87,6 @@ class HalfEdgeMesh:
 
 class DynamicVoronoi(HalfEdgeMesh):
     def __init__(self, image: np.ndarray, vertices: np.ndarray) -> None:
-        n_real = vertices.shape[0]
         height, width = image.shape[0], image.shape[1]
         r = 10 * max(height, width)
         cy, cx = height / 2, width / 2
@@ -95,15 +95,45 @@ class DynamicVoronoi(HalfEdgeMesh):
         tris = Delaunay(vertices).simplices
         self._make_ccw(vertices, tris)
         super().__init__(vertices, tris)
-
-        centers = self.circumcenters_and_radii2()[0]
-        colors = np.zeros((vertices.shape[0], 3))
-        counts = np.zeros(vertices.shape[0])
-
         self.image = image
         self.image_dx = np.concatenate((np.zeros((height, 1, image.shape[2]), image.dtype),
                                         np.cumsum(image, axis=1)), axis=1)
 
+    def plot(self) -> None:
+        centers = self.circumcenters_and_radii2()[0]
+        polygons = self.get_voronoi_polygons(centers)
+        colors = self.get_voronoi_colors(centers)
+        for polygon, color in zip(polygons, colors):
+            color = np.clip(color, 0, 1)
+            poly = Polygon(
+                polygon[:, ::-1],
+                closed=True,  # automatically closes the shape
+                facecolor=color,  # interior color
+                edgecolor=None,  # border colour
+                linewidth=0,
+                alpha=1  # transparency (0‑1)
+            )
+            plt.gca().add_patch(poly)
+        plt.xlim([0, self.image.shape[1]])
+        plt.ylim([self.image.shape[0], 0])
+
+    def get_voronoi_polygons(self, centers: np.ndarray | None) -> list[np.ndarray]:
+        if centers is None:
+            centers = self.circumcenters_and_radii2()[0]
+        polygons = []
+        for i in range(len(self.vertices)-N_GHOST_VERTICES):
+            hedges = self.get_vertex_half_edges(i)
+            hedges = np.array(hedges, dtype=int)
+            polygons.append(centers[hedges])
+        return polygons
+
+    def get_voronoi_colors(self, centers: np.ndarray | None) -> np.ndarray:
+        if centers is None:
+            centers = self.circumcenters_and_radii2()[0]
+        height = self.image.shape[0]
+        width = self.image.shape[1]
+        colors = np.zeros((self.vertices.shape[0], 3))
+        counts = np.zeros(self.vertices.shape[0])
         for he in range(len(self.he_tip)):
             if self.he_face[he] == -1 or self.he_face[self.he_pair[he]] == -1:
                 continue
@@ -122,32 +152,9 @@ class DynamicVoronoi(HalfEdgeMesh):
             v = self.he_tip[he]
             colors[v] += sign * np.sum(self.image_dx[i, js], axis=0)
             counts[v] += sign * js.sum()
-        colors = colors[:n_real] / counts[:n_real, None]
-        self.colors = colors
-
-        polygons = []
-        for i in range(n_real):
-            hedges = self.get_vertex_half_edges(i)
-            hedges = np.array(hedges, dtype=int)
-            polygons.append(centers[hedges])
-
-        plt.imshow(image)
-        for polygon, color in zip(polygons, colors):
-            color = np.clip(color, 0, 1)
-            poly = Polygon(
-                polygon[:, ::-1],
-                closed=True,  # automatically closes the shape
-                facecolor=color,  # interior color
-                edgecolor=None,  # border colour
-                linewidth=0,
-                alpha=1  # transparency (0‑1)
-            )
-            plt.gca().add_patch(poly)
-
-        plt.xlim([0, image.shape[1]])
-        plt.ylim([image.shape[0], 0])
-
-        plt.show()
+        n_vertices = self.vertices.shape[0] - N_GHOST_VERTICES
+        colors = colors[:n_vertices] / counts[:n_vertices, None]
+        return colors
 
     @staticmethod
     def _make_ccw(vertices: np.ndarray, tris: np.ndarray) -> None:
@@ -190,6 +197,8 @@ def main() -> None:
     vertices[:, 0] *= image.shape[0]
     vertices[:, 1] *= image.shape[1]
     voronoi = DynamicVoronoi(image, vertices)
+    voronoi.plot()
+    plt.show()
 
 if __name__ == '__main__':
     main()
